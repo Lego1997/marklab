@@ -5,6 +5,8 @@ import { pathToFileURL } from 'node:url';
 import type { DbPool, DbQueryResult, DbTransactionClient } from '../db/client';
 import { createHttpApp } from '../http/app';
 import { hashToken } from '../services/access-control';
+import type { AppleAuthClaims } from '../services/apple-auth-service';
+import { registerWithEmail } from '../services/email-auth-service';
 import { createUnavailableLiveMarkdownWriter } from '../services/live-writer';
 
 type WorkspaceRole = 'Owner' | 'Member' | 'Reader';
@@ -31,6 +33,22 @@ interface LocalOidcStateRecord {
   native_callback: boolean;
   native_app_state: string | null;
   return_to: string | null;
+  provider: string;
+  nonce: string | null;
+  expires_at: string;
+  used_at: string | null;
+}
+
+interface LocalEmailCredentialRecord {
+  user_id: string;
+  password_hash: string;
+  email_verified: boolean;
+}
+
+interface LocalEmailTokenRecord {
+  token_hash: string;
+  user_id: string;
+  purpose: string;
   expires_at: string;
   used_at: string | null;
 }
@@ -85,6 +103,23 @@ export interface OidcLocalSmokeResult {
   };
   nativeCallbackUrl: string;
   oidcRequests: MockOidcState;
+  microsoft: {
+    issuer: string;
+    userId: string;
+    email: string;
+    provider: string;
+    oidcRequests: MockOidcState;
+  };
+  email: {
+    userId: string;
+    email: string;
+  };
+  apple: {
+    userId: string;
+    email: string;
+    subject: string;
+    exchangeCalls: number;
+  };
 }
 
 const mockClientId = 'marklab-local-smoke';
@@ -94,6 +129,12 @@ const mockUser = {
   email: 'owner@example.test',
   email_verified: true,
   name: 'Owner Smoke',
+} satisfies MockAccessTokenClaims;
+const mockMicrosoftUser = {
+  sub: 'local-smoke-microsoft',
+  email: 'microsoft-owner@example.test',
+  email_verified: true,
+  name: 'Microsoft Smoke',
 } satisfies MockAccessTokenClaims;
 
 function base64UrlSha256(value: string): string {
@@ -149,12 +190,22 @@ async function reservePort(): Promise<number> {
   return port;
 }
 
-function createLocalGate6Pool(): { pool: DbPool; state: { users: LocalUserRecord[]; workspaces: LocalWorkspaceRecord[] } } {
+function createLocalGate6Pool(): {
+  pool: DbPool;
+  state: {
+    users: LocalUserRecord[];
+    workspaces: LocalWorkspaceRecord[];
+    emailCredentials: LocalEmailCredentialRecord[];
+    oidcStates: LocalOidcStateRecord[];
+  };
+} {
   const users: LocalUserRecord[] = [];
   const sessions: LocalSessionRecord[] = [];
   const oidcStates: LocalOidcStateRecord[] = [];
   const workspaces: LocalWorkspaceRecord[] = [];
   const members: LocalWorkspaceMemberRecord[] = [];
+  const emailCredentials: LocalEmailCredentialRecord[] = [];
+  const emailTokens: LocalEmailTokenRecord[] = [];
   let nextUserId = 1;
   let nextSessionId = 1;
   let nextWorkspaceId = 1;
@@ -163,12 +214,17 @@ function createLocalGate6Pool(): { pool: DbPool; state: { users: LocalUserRecord
     if (sql === 'begin' || sql === 'commit' || sql === 'rollback') return { rows: [], rowCount: 0 };
 
     if (sql.includes('insert into oidc_login_states')) {
+      // OIDC: (state_hash, code_verifier, native_callback, native_app_state, return_to, provider, expires_at)
+      // Apple: (state_hash, code_verifier, native_callback, native_app_state, return_to, provider, nonce, expires_at)
+      const hasNonceColumn = sql.includes('nonce');
       oidcStates.push({
         state_hash: String(params?.[0]),
         code_verifier: String(params?.[1]),
         native_callback: params?.[2] === true,
         native_app_state: typeof params?.[3] === 'string' ? params[3] : null,
         return_to: typeof params?.[4] === 'string' ? params[4] : null,
+        provider: typeof params?.[5] === 'string' ? params[5] : 'google',
+        nonce: hasNonceColumn && typeof params?.[6] === 'string' ? params[6] : null,
         expires_at: '2999-01-01T00:00:00.000Z',
         used_at: null,
       });
@@ -176,7 +232,14 @@ function createLocalGate6Pool(): { pool: DbPool; state: { users: LocalUserRecord
     }
 
     if (sql.includes('update oidc_login_states')) {
-      const state = oidcStates.find((candidate) => candidate.state_hash === params?.[0] && !candidate.used_at);
+      // Apple scopes the update by provider; the OIDC route does not.
+      const providerFilter = sql.includes('and provider = $2') ? params?.[1] : undefined;
+      const state = oidcStates.find(
+        (candidate) =>
+          candidate.state_hash === params?.[0]
+          && !candidate.used_at
+          && (providerFilter === undefined || candidate.provider === providerFilter),
+      );
       if (!state) return { rows: [], rowCount: 0 };
       state.used_at = '2026-05-22T00:00:00.000Z';
       return { rows: [{
@@ -184,6 +247,7 @@ function createLocalGate6Pool(): { pool: DbPool; state: { users: LocalUserRecord
         native_callback: state.native_callback,
         native_app_state: state.native_app_state,
         return_to: state.return_to,
+        provider: state.provider,
       } as Row], rowCount: 1 };
     }
 
@@ -244,6 +308,18 @@ function createLocalGate6Pool(): { pool: DbPool; state: { users: LocalUserRecord
       };
     }
 
+    // Revoke-all-for-user (password reset eviction): revoke every active session.
+    if (sql.includes('update user_sessions') && sql.includes('where user_id = $1')) {
+      let revoked = 0;
+      for (const session of sessions) {
+        if (session.user_id === params?.[0] && !session.revoked_at) {
+          session.revoked_at = '2026-05-22T00:00:00.000Z';
+          revoked += 1;
+        }
+      }
+      return { rows: [], rowCount: revoked };
+    }
+
     if (sql.includes('insert into workspaces')) {
       const row: LocalWorkspaceRecord = {
         id: `ws_${nextWorkspaceId++}`,
@@ -280,6 +356,90 @@ function createLocalGate6Pool(): { pool: DbPool; state: { users: LocalUserRecord
       return { rows: rows as Row[], rowCount: rows.length };
     }
 
+    // --- Apple: repeat-login email lookup by (provider, subject). ---
+    if (sql.includes('select email from users') && sql.includes('where auth_provider = $1 and auth_subject = $2')) {
+      const user = users.find((candidate) => candidate.auth_provider === params?.[0] && candidate.auth_subject === params?.[1]);
+      return { rows: user ? [{ email: user.email } as Row] : [], rowCount: user ? 1 : 0 };
+    }
+
+    // --- Email register: find-or-create the shared users row by (provider, subject). ---
+    if (sql.includes('select id, email, display_name') && sql.includes('from users') && sql.includes('where auth_provider = $1 and auth_subject = $2')) {
+      const user = users.find((candidate) => candidate.auth_provider === params?.[0] && candidate.auth_subject === params?.[1]);
+      return {
+        rows: user ? [{ id: user.id, email: user.email, display_name: user.display_name } as Row] : [],
+        rowCount: user ? 1 : 0,
+      };
+    }
+
+    // --- Email credentials lookups / writes. ---
+    if (sql.includes('select user_id from email_auth_credentials')) {
+      const credential = emailCredentials.find((candidate) => candidate.user_id === params?.[0]);
+      return { rows: credential ? [{ user_id: credential.user_id } as Row] : [], rowCount: credential ? 1 : 0 };
+    }
+
+    if (sql.includes('insert into email_auth_credentials')) {
+      const userId = String(params?.[0]);
+      // Mirror `on conflict (user_id) do nothing returning user_id`: only insert
+      // (and return a row) when no credential exists for the user yet.
+      const existing = emailCredentials.find((candidate) => candidate.user_id === userId);
+      if (existing) return { rows: [], rowCount: 0 };
+      emailCredentials.push({
+        user_id: userId,
+        password_hash: String(params?.[1]),
+        email_verified: false,
+      });
+      return { rows: [{ user_id: userId } as Row], rowCount: 1 };
+    }
+
+    if (sql.includes('update email_auth_credentials') && sql.includes('email_verified = true')) {
+      const credential = emailCredentials.find((candidate) => candidate.user_id === params?.[0]);
+      if (credential) credential.email_verified = true;
+      return { rows: [], rowCount: credential ? 1 : 0 };
+    }
+
+    if (sql.includes('update email_auth_credentials') && sql.includes('set password_hash = $1')) {
+      const credential = emailCredentials.find((candidate) => candidate.user_id === params?.[1]);
+      if (credential) credential.password_hash = String(params?.[0]);
+      return { rows: [], rowCount: credential ? 1 : 0 };
+    }
+
+    // --- Email login: join credentials + users by (provider, subject). ---
+    if (sql.includes('from email_auth_credentials eac') && sql.includes('join users u')) {
+      const user = users.find((candidate) => candidate.auth_provider === params?.[0] && candidate.auth_subject === params?.[1]);
+      const credential = user ? emailCredentials.find((candidate) => candidate.user_id === user.id) : undefined;
+      if (!user || !credential) return { rows: [], rowCount: 0 };
+      return {
+        rows: [{
+          user_id: credential.user_id,
+          password_hash: credential.password_hash,
+          email_verified: credential.email_verified,
+          email: user.email,
+          display_name: user.display_name,
+        } as Row],
+        rowCount: 1,
+      };
+    }
+
+    // --- Email verification / reset tokens. ---
+    if (sql.includes('insert into email_verification_tokens')) {
+      emailTokens.push({
+        token_hash: String(params?.[0]),
+        user_id: String(params?.[1]),
+        purpose: String(params?.[2]),
+        expires_at: '2999-01-01T00:00:00.000Z',
+        used_at: null,
+      });
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.includes('update email_verification_tokens') && sql.includes('set used_at = now()')) {
+      const purpose = sql.includes("purpose = 'verify_email'") ? 'verify_email' : 'reset_password';
+      const token = emailTokens.find((candidate) => candidate.token_hash === params?.[0] && candidate.purpose === purpose && !candidate.used_at);
+      if (!token) return { rows: [], rowCount: 0 };
+      token.used_at = '2026-05-22T00:00:00.000Z';
+      return { rows: [{ user_id: token.user_id } as Row], rowCount: 1 };
+    }
+
     throw new Error(`unexpected_query:${sql}`);
   };
 
@@ -290,10 +450,12 @@ function createLocalGate6Pool(): { pool: DbPool; state: { users: LocalUserRecord
     },
   };
 
-  return { pool, state: { users, workspaces } };
+  return { pool, state: { users, workspaces, emailCredentials, oidcStates } };
 }
 
-async function startMockOidcProvider(): Promise<{ issuer: string; requests: MockOidcState; close: () => Promise<void> }> {
+async function startMockOidcProvider(
+  user: MockAccessTokenClaims = mockUser,
+): Promise<{ issuer: string; requests: MockOidcState; close: () => Promise<void> }> {
   const requests: MockOidcState = {
     authorizationRequests: 0,
     discoveryRequests: 0,
@@ -357,7 +519,7 @@ async function startMockOidcProvider(): Promise<{ issuer: string; requests: Mock
         if (base64UrlSha256(verifier) !== issued.codeChallenge) return badRequest(res, 'invalid_pkce_verifier');
         issued.used = true;
         const accessToken = `mock_access_${nextAccessToken++}`;
-        accessTokens.set(accessToken, mockUser);
+        accessTokens.set(accessToken, user);
         json(res, 200, { access_token: accessToken, token_type: 'Bearer' });
         return;
       }
@@ -409,6 +571,49 @@ function requireOk(response: Response, label: string): void {
   if (!response.ok) throw new Error(`${label}_failed:${response.status}`);
 }
 
+/**
+ * Drives one Apple Sign In web (form_post) round trip against the local app.
+ * The authorization redirect points at the real appleid.apple.com endpoint, so
+ * it is NEVER followed — we read the state from the Set-Cookie header and POST
+ * the form_post callback directly. The injected fake exchange stands in for the
+ * Apple token endpoint + JWKS, so no network call is made.
+ */
+async function runAppleCallback(input: { apiBaseUrl: string }): Promise<{
+  user: { userId: string; email: string; displayName: string };
+  token: string;
+}> {
+  const startResponse = await fetch(`${input.apiBaseUrl}/api/auth/apple/start`, { redirect: 'manual' });
+  if (startResponse.status !== 302) throw new Error(`apple_start_redirect_failed:${startResponse.status}`);
+  const location = startResponse.headers.get('location');
+  if (!location || !location.startsWith('https://appleid.apple.com/auth/authorize')) {
+    throw new Error('apple_start_did_not_target_apple_authorize');
+  }
+  const stateCookie = cookieHeader(startResponse, 'marklab_apple_state');
+  const state = decodeURIComponent(stateCookie.split('=')[1] ?? '');
+  if (!state) throw new Error('missing_apple_state_cookie');
+
+  const callbackResponse = await fetch(`${input.apiBaseUrl}/api/auth/apple/callback`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', cookie: stateCookie },
+    body: new URLSearchParams({ code: 'apple_mock_code', state }).toString(),
+  });
+  // Web (non-native) callback 303-redirects back to the web app and sets the
+  // session cookie; the minted user identity is recovered from that cookie.
+  if (callbackResponse.status !== 303) throw new Error(`apple_callback_redirect_failed:${callbackResponse.status}`);
+  const sessionCookieHeader = cookieHeader(callbackResponse, 'marklab_session');
+  const token = decodeURIComponent(sessionCookieHeader.split('=')[1] ?? '');
+  if (!token) throw new Error('missing_apple_session_cookie');
+
+  const session = await fetchJson<{ authenticated: boolean; user: { userId: string; email: string; displayName: string } }>(
+    `${input.apiBaseUrl}/api/auth/session`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  requireOk(session.response, 'apple_session_read');
+  if (!session.body.authenticated) throw new Error('apple_session_not_authenticated');
+  return { user: session.body.user, token };
+}
+
 function redactedNativeCallbackUrl(input: {
   rawToken: string;
   appState: string;
@@ -430,14 +635,48 @@ function redactedNativeCallbackUrl(input: {
   return callbackUrl.toString();
 }
 
+// Apple Sign In subject used by the injected fake exchange. Apple only returns
+// the email on the FIRST login for a subject; on repeat logins the route must
+// recover it from the stored users row (lookup by auth_subject).
+const appleSubject = 'apple-sub-local-smoke';
+const appleEmail = 'apple-owner@example.test';
+const appleName = 'Apple Smoke';
+
 export async function runLocalOidcSmoke(): Promise<OidcLocalSmokeResult> {
   const checks: string[] = [];
   const oidc = await startMockOidcProvider();
+  const microsoftOidc = await startMockOidcProvider(mockMicrosoftUser);
   const apiPort = await reservePort();
   const apiBaseUrl = `http://127.0.0.1:${apiPort}`;
   const webBaseUrl = 'http://127.0.0.1:5173';
   const redirectUri = `${apiBaseUrl}/auth/callback`;
-  const { pool } = createLocalGate6Pool();
+  const { pool, state: poolState } = createLocalGate6Pool();
+
+  // Fake Apple exchange: real network/JWKS verification is replaced. Emits the
+  // email only on the first call so the repeat-login email-by-subject lookup is
+  // exercised. `firstName`/`lastName` are honored exactly like the real path.
+  // Boxed in an object so the counter survives mutation across the
+  // `runAppleCallback` function boundary. Read via `appleExchangeCalls()` so TS
+  // does not literal-narrow it after an equality guard.
+  const appleExchangeState = { calls: 0 };
+  const appleExchangeCalls = (): number => appleExchangeState.calls;
+  const appleExchange = async (input: {
+    code: string;
+    codeVerifier: string;
+    config: { clientId: string };
+    userName?: { firstName?: string | null; lastName?: string | null };
+  }): Promise<AppleAuthClaims> => {
+    appleExchangeState.calls += 1;
+    const isFirstLogin = appleExchangeState.calls === 1;
+    if (!input.code || !input.codeVerifier) throw new Error('apple_token_exchange_failed');
+    return {
+      subject: appleSubject,
+      emailVerified: true,
+      ...(isFirstLogin ? { email: appleEmail } : {}),
+      ...(isFirstLogin ? { name: appleName } : {}),
+    };
+  };
+
   const app = createHttpApp(pool, createUnavailableLiveMarkdownWriter(), {
     authEnvironment: {
       devAuth: false,
@@ -447,6 +686,43 @@ export async function runLocalOidcSmoke(): Promise<OidcLocalSmokeResult> {
         clientId: mockClientId,
         clientSecret: mockClientSecret,
         redirectUri,
+      },
+    },
+    authProviders: {
+      // Microsoft OIDC against a second loopback mock provider. The loopback
+      // mock issuer genuinely differs from the configured issuer, so disable the
+      // discovery issuer-match check. Email verification is enforced (the mock
+      // returns email_verified:true). Note: production pins a concrete tenant and
+      // validates the id_token `tid` via idTokenValidation; this smoke exercises
+      // the userinfo path and does not mock a signed id_token / JWKS.
+      oidcProviders: {
+        microsoft: {
+          issuer: microsoftOidc.issuer,
+          clientId: mockClientId,
+          clientSecret: mockClientSecret,
+          redirectUri,
+          requireDiscoveryIssuerMatch: false,
+        },
+      },
+      // Apple config is structurally valid but never used to hit Apple — the
+      // injected `appleExchange` replaces the network token exchange + JWKS.
+      apple: {
+        clientId: 'com.example.marklab.smoke',
+        teamId: 'TEAMID1234',
+        keyId: 'KEYID12345',
+        privateKey: 'unused-by-fake-exchange',
+        redirectUri: `${apiBaseUrl}/api/auth/apple/callback`,
+      },
+      appleExchange,
+      appleBaseUrls: { apiBaseUrl, webBaseUrl },
+      // Email routes mount only when this is present. The values are never used
+      // to send mail in this smoke: registration is driven through the service
+      // directly (no Resend network call) and verification is simulated.
+      email: {
+        resendApiKey: 're_local_smoke_unused',
+        emailFrom: 'MarkLab Smoke <noreply@example.test>',
+        apiBaseUrl,
+        webBaseUrl,
       },
     },
   });
@@ -540,6 +816,150 @@ export async function runLocalOidcSmoke(): Promise<OidcLocalSmokeResult> {
     }
     checks.push('oidc_discovery_token_and_userinfo_endpoints_were_exercised');
 
+    // ---------------------------------------------------------------------
+    // Microsoft OIDC (provider=microsoft) against a second loopback provider.
+    // ---------------------------------------------------------------------
+    const msStart = await fetchJson<{ authorizationUrl: string }>(`${apiBaseUrl}/api/auth/oidc/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'microsoft' }),
+    });
+    requireOk(msStart.response, 'microsoft_oidc_start');
+    const msAuthUrl = new URL(msStart.body.authorizationUrl);
+    if (!msAuthUrl.toString().startsWith(microsoftOidc.issuer)) throw new Error('microsoft_authorization_url_wrong_issuer');
+    const msState = msAuthUrl.searchParams.get('state');
+    if (!msState) throw new Error('missing_microsoft_oidc_state');
+    const msCookie = cookieHeader(msStart.response, 'marklab_oidc_state');
+    // The login-state row must carry provider=microsoft (else the callback would
+    // resolve the Google config and exchange against the wrong issuer).
+    const msStateRow = poolState.oidcStates.find((candidate) => candidate.state_hash === hashToken(msState));
+    if (!msStateRow || msStateRow.provider !== 'microsoft') throw new Error('microsoft_provider_not_persisted_in_login_state');
+    checks.push('microsoft_oidc_start_persists_provider_and_targets_microsoft_issuer');
+
+    const msAuthorize = await fetch(msStart.body.authorizationUrl, { redirect: 'manual' });
+    if (msAuthorize.status !== 302) throw new Error(`microsoft_authorize_redirect_failed:${msAuthorize.status}`);
+    const msCallbackLocation = msAuthorize.headers.get('location');
+    if (!msCallbackLocation) throw new Error('missing_microsoft_authorize_location');
+    const msCode = new URL(msCallbackLocation).searchParams.get('code');
+    if (!msCode) throw new Error('missing_microsoft_authorize_code');
+
+    const msCallback = await fetchJson<{ user: { userId: string; email: string; displayName: string }; token: string }>(
+      `${apiBaseUrl}/api/auth/oidc/callback`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: msCookie },
+        body: JSON.stringify({ code: msCode, state: msState }),
+      },
+    );
+    requireOk(msCallback.response, 'microsoft_oidc_callback');
+    if (!msCallback.body.token.startsWith('ml_user_')) throw new Error('missing_microsoft_user_session_token');
+    if (msCallback.body.user.email !== mockMicrosoftUser.email) throw new Error('unexpected_microsoft_identity');
+    if (msStateRow.used_at === null) throw new Error('microsoft_login_state_not_consumed');
+    // The minted Microsoft user must be distinct from the Google user above.
+    if (msCallback.body.user.userId === callback.body.user.userId) throw new Error('microsoft_user_collided_with_google');
+    const msSession = await fetchJson<{ authenticated: boolean; user: { userId: string } }>(
+      `${apiBaseUrl}/api/auth/session`,
+      { headers: { Authorization: `Bearer ${msCallback.body.token}` } },
+    );
+    requireOk(msSession.response, 'microsoft_session_read');
+    if (!msSession.body.authenticated || msSession.body.user.userId !== msCallback.body.user.userId) throw new Error('microsoft_session_mismatch');
+    if (microsoftOidc.requests.tokenRequests !== 1 || microsoftOidc.requests.userinfoRequests !== 1) throw new Error('unexpected_microsoft_request_counts');
+    checks.push('microsoft_oidc_callback_mints_ml_user_session_via_provider_routed_exchange');
+
+    // ---------------------------------------------------------------------
+    // Email register -> simulate verify -> login (+ negative cases).
+    // Registration is exercised through the real service against the in-memory
+    // pool (no Resend network); verification is simulated by flipping the
+    // email_verified flag; login/negative paths go through the HTTP routes.
+    // ---------------------------------------------------------------------
+    const emailAddress = 'email-user@example.test';
+    const emailPassword = 'correct-horse-battery-staple';
+    const { userId: emailUserId } = await registerWithEmail(pool, {
+      email: emailAddress,
+      password: emailPassword,
+      displayName: 'Email Smoke',
+    });
+    const emailCredential = poolState.emailCredentials.find((candidate) => candidate.user_id === emailUserId);
+    if (!emailCredential) throw new Error('email_credential_not_created');
+    if (emailCredential.email_verified !== false) throw new Error('email_unexpectedly_pre_verified');
+    checks.push('email_register_creates_unverified_credential');
+
+    // Login before verification must be rejected.
+    const unverifiedLogin = await fetchJson<{ error?: string }>(`${apiBaseUrl}/api/auth/email/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: emailAddress, password: emailPassword }),
+    });
+    if (unverifiedLogin.response.status !== 403 || unverifiedLogin.body.error !== 'email_not_verified') {
+      throw new Error(`email_login_before_verify_not_rejected:${unverifiedLogin.response.status}`);
+    }
+    checks.push('email_login_rejected_until_verified');
+
+    // Simulate the verification step by flipping email_verified.
+    emailCredential.email_verified = true;
+
+    const verifiedLogin = await fetchJson<{ user: { userId: string; email: string }; token: string }>(
+      `${apiBaseUrl}/api/auth/email/login`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: emailAddress, password: emailPassword }),
+      },
+    );
+    requireOk(verifiedLogin.response, 'email_login');
+    if (!verifiedLogin.body.token.startsWith('ml_user_')) throw new Error('missing_email_user_session_token');
+    if (verifiedLogin.body.user.userId !== emailUserId) throw new Error('email_login_user_mismatch');
+    const emailSession = await fetchJson<{ authenticated: boolean; user: { userId: string } }>(
+      `${apiBaseUrl}/api/auth/session`,
+      { headers: { Authorization: `Bearer ${verifiedLogin.body.token}` } },
+    );
+    requireOk(emailSession.response, 'email_session_read');
+    if (!emailSession.body.authenticated || emailSession.body.user.userId !== emailUserId) throw new Error('email_session_mismatch');
+    checks.push('email_login_after_verify_mints_ml_user_session');
+
+    // Wrong password is rejected with the generic invalid_email_or_password.
+    const wrongPassword = await fetchJson<{ error?: string }>(`${apiBaseUrl}/api/auth/email/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: emailAddress, password: 'totally-wrong-password' }),
+    });
+    if (wrongPassword.response.status !== 401 || wrongPassword.body.error !== 'invalid_email_or_password') {
+      throw new Error(`email_wrong_password_not_rejected:${wrongPassword.response.status}`);
+    }
+    checks.push('email_login_rejects_wrong_password');
+
+    // Unknown email is enumeration-safe: same status + error as wrong password.
+    const unknownEmail = await fetchJson<{ error?: string }>(`${apiBaseUrl}/api/auth/email/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'nobody-unknown@example.test', password: emailPassword }),
+    });
+    if (unknownEmail.response.status !== wrongPassword.response.status || unknownEmail.body.error !== wrongPassword.body.error) {
+      throw new Error(`email_unknown_address_not_enumeration_safe:${unknownEmail.response.status}:${unknownEmail.body.error}`);
+    }
+    checks.push('email_login_unknown_address_is_enumeration_safe');
+
+    // ---------------------------------------------------------------------
+    // Apple callback (form_post) with the injected fake exchange.
+    // ---------------------------------------------------------------------
+    const appleFirst = await runAppleCallback({ apiBaseUrl });
+    if (!appleFirst.token.startsWith('ml_user_')) throw new Error('missing_apple_user_session_token');
+    if (appleFirst.user.email !== appleEmail) throw new Error('unexpected_apple_first_login_email');
+    if (appleExchangeCalls() !== 1) throw new Error('apple_exchange_not_invoked_once');
+    const appleUserId = appleFirst.user.userId;
+    checks.push('apple_first_login_mints_ml_user_session_and_stores_email');
+
+    // Repeat login: the fake omits the email, so the route must recover it from
+    // the stored users row via the (provider, subject) lookup and reuse the user.
+    const appleRepeat = await runAppleCallback({ apiBaseUrl });
+    if (!appleRepeat.token.startsWith('ml_user_')) throw new Error('missing_apple_repeat_session_token');
+    if (appleRepeat.user.email !== appleEmail) throw new Error('apple_repeat_login_email_lookup_failed');
+    if (appleRepeat.user.userId !== appleUserId) throw new Error('apple_repeat_login_user_collision');
+    if (appleExchangeCalls() !== 2) throw new Error('apple_exchange_not_invoked_twice');
+    const appleUsers = poolState.users.filter((candidate) => candidate.auth_provider === 'apple' && candidate.auth_subject === appleSubject);
+    if (appleUsers.length !== 1) throw new Error('apple_repeat_login_created_duplicate_user');
+    checks.push('apple_repeat_login_recovers_email_by_subject_and_reuses_user');
+
     return {
       ok: true,
       checks,
@@ -557,10 +977,28 @@ export async function runLocalOidcSmoke(): Promise<OidcLocalSmokeResult> {
         displayName: callback.body.user.displayName,
       }),
       oidcRequests: { ...oidc.requests },
+      microsoft: {
+        issuer: microsoftOidc.issuer,
+        userId: msCallback.body.user.userId,
+        email: msCallback.body.user.email,
+        provider: msStateRow.provider,
+        oidcRequests: { ...microsoftOidc.requests },
+      },
+      email: {
+        userId: emailUserId,
+        email: emailAddress,
+      },
+      apple: {
+        userId: appleUserId,
+        email: appleFirst.user.email,
+        subject: appleSubject,
+        exchangeCalls: appleExchangeCalls(),
+      },
     };
   } finally {
     await close(apiServer);
     await oidc.close();
+    await microsoftOidc.close();
   }
 }
 

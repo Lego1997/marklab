@@ -21,7 +21,10 @@ const alphaLoginSchema = z.object({
   subject: z.string().min(1).max(160).optional(),
 });
 
+export type OidcProvider = 'google' | 'microsoft';
+
 const oidcStartSchema = z.object({
+  provider: z.enum(['google', 'microsoft']).optional().default('google'),
   native: z.boolean().optional(),
   appState: z.string().min(32).max(512).optional(),
   returnTo: z.string().min(1).max(1024).optional(),
@@ -35,7 +38,10 @@ const oidcCallbackSchema = z.object({
 export interface AuthRouteOptions {
   devAuthEnabled?: boolean;
   cookieSecure?: boolean;
+  /** Legacy single OIDC config; treated as the `google` provider fallback. */
   oidcConfig?: OidcAuthConfig;
+  /** Per-provider OIDC configs. Providers present here are enabled. */
+  oidcProviders?: Partial<Record<OidcProvider, OidcAuthConfig>>;
   oidcExchange?: OidcExchange;
 }
 
@@ -91,13 +97,23 @@ function normalizeReturnTo(value: string | undefined): string | null {
   return value;
 }
 
+function resolveOidcConfig(options: AuthRouteOptions, provider: OidcProvider): OidcAuthConfig | undefined {
+  return options.oidcProviders?.[provider] ?? (provider === 'google' ? options.oidcConfig : undefined);
+}
+
+function hasAnyOidcConfig(options: AuthRouteOptions): boolean {
+  return Boolean(options.oidcConfig) || Object.keys(options.oidcProviders ?? {}).length > 0;
+}
+
 export function createAuthRoutes(pool: DbPool, options: AuthRouteOptions = {}) {
   const router = Router();
 
   router.post('/auth/oidc/start', async (req: Request, res: Response, next: NextFunction) => {
     try {
-      if (!options.oidcConfig) throw new Error('oidc_not_configured');
       const body = oidcStartSchema.parse(req.body);
+      const provider = body?.provider ?? 'google';
+      const config = resolveOidcConfig(options, provider);
+      if (!config) throw new Error('oidc_not_configured');
       const state = authToken();
       const codeVerifier = authToken();
       const nativeCallback = body?.native === true;
@@ -106,14 +122,14 @@ export function createAuthRoutes(pool: DbPool, options: AuthRouteOptions = {}) {
       const returnTo = normalizeReturnTo(body?.returnTo);
       await pool.query(
         `insert into oidc_login_states
-           (state_hash, code_verifier, native_callback, native_app_state, return_to, expires_at)
-         values ($1, $2, $3, $4, $5, now() + ($6 * interval '1 second'))`,
-        [hashToken(state), codeVerifier, nativeCallback, nativeAppState, returnTo, OIDC_LOGIN_STATE_TTL_SECONDS],
+           (state_hash, code_verifier, native_callback, native_app_state, return_to, provider, expires_at)
+         values ($1, $2, $3, $4, $5, $6, now() + ($7 * interval '1 second'))`,
+        [hashToken(state), codeVerifier, nativeCallback, nativeAppState, returnTo, provider, OIDC_LOGIN_STATE_TTL_SECONDS],
       );
       res.setHeader('set-cookie', oidcStateCookie(state, options));
       res.status(201).json({
         authorizationUrl: await buildOidcAuthorizationUrl({
-          config: options.oidcConfig,
+          config,
           state,
           codeVerifier,
         }),
@@ -125,26 +141,29 @@ export function createAuthRoutes(pool: DbPool, options: AuthRouteOptions = {}) {
 
   router.post('/auth/oidc/callback', async (req: Request, res: Response, next: NextFunction) => {
     try {
-      if (!options.oidcConfig) throw new Error('oidc_not_configured');
+      if (!hasAnyOidcConfig(options)) throw new Error('oidc_not_configured');
       const body = oidcCallbackSchema.parse(req.body);
       const cookieState = parseCookieHeader(req.header('cookie'))[OIDC_STATE_COOKIE];
       if (!cookieState || cookieState !== body.state) throw new Error('oidc_login_state_invalid');
-      const stateResult = await pool.query<{ code_verifier: string; native_callback: boolean; native_app_state: string | null; return_to: string | null }>(
+      const stateResult = await pool.query<{ code_verifier: string; native_callback: boolean; native_app_state: string | null; return_to: string | null; provider: string | null }>(
         `update oidc_login_states
             set used_at = now()
           where state_hash = $1
             and used_at is null
             and expires_at > now()
-          returning code_verifier, native_callback, native_app_state, return_to`,
+          returning code_verifier, native_callback, native_app_state, return_to, provider`,
         [hashToken(body.state)],
       );
       const stateRow = stateResult.rows[0];
       const codeVerifier = stateRow?.code_verifier;
       if (!codeVerifier) throw new Error('oidc_login_state_invalid');
+      const provider = (stateRow.provider ?? 'google') as OidcProvider;
+      const config = resolveOidcConfig(options, provider);
+      if (!config) throw new Error('oidc_not_configured');
       const claims = await (options.oidcExchange ?? exchangeOidcCode)({
         code: body.code,
         codeVerifier,
-        config: options.oidcConfig,
+        config,
       });
       const session = await createUserSession(pool, claims);
       res.setHeader('set-cookie', [sessionCookie(session.token, options), clearOidcStateCookie(options), clearLegacyRootSessionCookie(options)]);

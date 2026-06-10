@@ -229,3 +229,20 @@ export async function revokeUserSession(pool: DbExecutor, token: string | undefi
     [hashToken(token)],
   );
 }
+
+/**
+ * Revokes every active session for a user. Used by security-sensitive flows
+ * (e.g. password reset) so that completing the flow evicts any session an
+ * attacker may already hold for the account. Returns the number of sessions
+ * revoked.
+ */
+export async function revokeAllUserSessions(pool: DbExecutor, userId: string): Promise<number> {
+  const result = await pool.query(
+    `update user_sessions
+        set revoked_at = now()
+      where user_id = $1
+        and revoked_at is null`,
+    [userId],
+  );
+  return result.rowCount ?? 0;
+}

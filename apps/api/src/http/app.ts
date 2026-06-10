@@ -4,8 +4,10 @@ import express, { type ErrorRequestHandler, type NextFunction, type Request, typ
 import { ZodError } from 'zod';
 import type { DbPool } from '../db/client';
 import { createAccessRoutes } from '../routes/access-routes';
-import { createAuthRoutes } from '../routes/auth-routes';
+import { createAppleAuthRoutes, type AppleCodeExchange } from '../routes/apple-auth-routes';
+import { createAuthRoutes, type OidcProvider } from '../routes/auth-routes';
 import { createBillingRoutes } from '../routes/billing-routes';
+import { createEmailAuthRoutes } from '../routes/email-auth-routes';
 import { createCloudCopyRoutes } from '../routes/cloud-copy-routes';
 import { createCollabSessionRoutes } from '../routes/collab-session-routes';
 import { createDocAiRoutes } from '../routes/doc-ai-routes';
@@ -24,6 +26,27 @@ import type { ProviderTokenService } from '../provider/ysweet-token-service';
 import { authenticateRequestUser } from '../services/user-service';
 import { requireUserDocumentAccess } from '../services/control-plane-access';
 import type { OidcAuthConfig, OidcExchange } from '../services/oidc-service';
+import type { AppleAuthConfig } from '../services/apple-auth-service';
+
+export interface EmailAuthEnvironment {
+  resendApiKey: string;
+  emailFrom: string;
+  apiBaseUrl: string;
+  webBaseUrl: string;
+}
+
+export interface AuthProvidersOptions {
+  /** Additional OIDC providers beyond Google (which is read from authEnvironment.oidc). */
+  oidcProviders?: Partial<Record<Exclude<OidcProvider, 'google'>, OidcAuthConfig>>;
+  /** Apple Sign In config; routes mount unconditionally but require this to function. */
+  apple?: AppleAuthConfig;
+  /** Override the Apple authorization-code exchange (test/smoke injection seam). */
+  appleExchange?: AppleCodeExchange;
+  /** Base URLs surfaced to the native Apple callback. */
+  appleBaseUrls?: { apiBaseUrl: string; webBaseUrl: string };
+  /** Email+password config; email routes mount only when present. */
+  email?: EmailAuthEnvironment;
+}
 
 export interface HttpAppOptions {
   flushCollabDocument?: (roomName: string) => Promise<void>;
@@ -46,6 +69,7 @@ export interface HttpAppOptions {
   staticCollabWeb?: StaticWebOptions;
   authEnvironment?: Partial<HttpAuthEnvironment>;
   oidcExchange?: OidcExchange;
+  authProviders?: AuthProvidersOptions;
 }
 
 export interface HttpAuthEnvironment {
@@ -458,6 +482,9 @@ const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
       || error.message === 'oidc_missing_token_endpoint'
       || error.message === 'oidc_missing_userinfo_endpoint'
       || error.message === 'oidc_missing_authorization_endpoint'
+      || error.message === 'oidc_missing_jwks_uri'
+      || error.message === 'oidc_id_token_verification_failed'
+      || error.message === 'oidc_tenant_not_allowed'
     )
   ) {
     res.status(401).json({ error: 'oidc_login_failed' });
@@ -466,6 +493,45 @@ const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
 
   if (error instanceof Error && error.message === 'oidc_invalid_claims') {
     res.status(400).json({ error: 'oidc_invalid_claims' });
+    return;
+  }
+
+  if (
+    error instanceof Error
+    && (
+      error.message === 'apple_token_exchange_failed'
+      || error.message === 'apple_missing_id_token'
+      || error.message === 'apple_id_token_verification_failed'
+      || error.message === 'apple_missing_sub'
+      || error.message === 'apple_email_unavailable'
+    )
+  ) {
+    res.status(401).json({ error: 'apple_login_failed' });
+    return;
+  }
+
+  if (error instanceof Error && error.message === 'password_too_short') {
+    res.status(400).json({ error: 'password_too_short' });
+    return;
+  }
+
+  if (error instanceof Error && error.message === 'invalid_email_or_password') {
+    res.status(401).json({ error: 'invalid_email_or_password' });
+    return;
+  }
+
+  if (error instanceof Error && error.message === 'email_not_verified') {
+    res.status(403).json({ error: 'email_not_verified' });
+    return;
+  }
+
+  if (error instanceof Error && error.message === 'invalid_or_expired_token') {
+    res.status(400).json({ error: 'invalid_or_expired_token' });
+    return;
+  }
+
+  if (error instanceof Error && error.message === 'email_send_failed') {
+    res.status(502).json({ error: 'email_send_failed' });
     return;
   }
 
@@ -668,12 +734,37 @@ export function createHttpApp(pool: DbPool, liveWriter: LiveMarkdownWriter, opti
     }
   });
 
+  const cookieSecure = authEnvironment.nodeEnv === 'production';
+  const authProviders = options.authProviders ?? {};
+  const oidcProviders: Partial<Record<OidcProvider, OidcAuthConfig>> = {
+    ...(authEnvironment.oidc ? { google: authEnvironment.oidc } : {}),
+    ...(authProviders.oidcProviders ?? {}),
+  };
   app.use('/api', createAuthRoutes(pool, {
     devAuthEnabled: authEnvironment.devAuth,
-    cookieSecure: authEnvironment.nodeEnv === 'production',
+    cookieSecure,
     ...(authEnvironment.oidc ? { oidcConfig: authEnvironment.oidc } : {}),
+    ...(Object.keys(oidcProviders).length > 0 ? { oidcProviders } : {}),
     ...(options.oidcExchange ? { oidcExchange: options.oidcExchange } : {}),
   }));
+  // Apple routes mount unconditionally so /api/auth/apple/native returns
+  // oidc_not_configured (not 404) when Apple Sign In is not configured.
+  app.use('/api/auth/apple', createAppleAuthRoutes(pool, {
+    ...(authProviders.apple ? { appleConfig: authProviders.apple } : {}),
+    ...(authProviders.appleExchange ? { exchangeAppleCode: authProviders.appleExchange } : {}),
+    cookieSecure,
+    apiBaseUrl: authProviders.appleBaseUrls?.apiBaseUrl ?? authProviders.email?.apiBaseUrl ?? '',
+    webBaseUrl: authProviders.appleBaseUrls?.webBaseUrl ?? authProviders.email?.webBaseUrl ?? '',
+  }));
+  if (authProviders.email) {
+    app.use('/api/auth/email', createEmailAuthRoutes(pool, {
+      cookieSecure,
+      resendApiKey: authProviders.email.resendApiKey,
+      emailFrom: authProviders.email.emailFrom,
+      apiBaseUrl: authProviders.email.apiBaseUrl,
+      webBaseUrl: authProviders.email.webBaseUrl,
+    }));
+  }
   app.use('/api', createWorkspaceRoutes(pool));
   app.use('/api', createBillingRoutes(pool));
   app.use('/api', createAccessRoutes(pool, routeOptions));

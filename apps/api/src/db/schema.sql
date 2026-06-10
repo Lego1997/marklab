@@ -45,8 +45,38 @@ alter table oidc_login_states
 alter table oidc_login_states
   add column if not exists return_to text;
 
+alter table oidc_login_states
+  add column if not exists provider varchar(32) not null default 'google';
+
+alter table oidc_login_states
+  add column if not exists nonce text;
+
 create index if not exists oidc_login_states_expiration_idx
   on oidc_login_states (expires_at)
+  where used_at is null;
+
+create table if not exists email_auth_credentials (
+  user_id uuid primary key references users(id) on delete cascade,
+  password_hash text not null,
+  email_verified boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists email_verification_tokens (
+  token_hash text primary key,
+  user_id uuid not null references users(id) on delete cascade,
+  purpose varchar(32) not null check (purpose in ('verify_email', 'reset_password')),
+  expires_at timestamptz not null,
+  used_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists email_verification_tokens_user_idx
+  on email_verification_tokens (user_id);
+
+create index if not exists email_verification_tokens_expiration_idx
+  on email_verification_tokens (expires_at)
   where used_at is null;
 
 create table if not exists workspaces (

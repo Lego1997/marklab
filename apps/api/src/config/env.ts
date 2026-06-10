@@ -25,6 +25,27 @@ export interface ApiEnv {
   ysweetCheckpointFreqSeconds: number;
   ysweetSkipGc: boolean;
   allowedOrigins: string[];
+  microsoftClientId?: string;
+  microsoftClientSecret?: string;
+  /**
+   * Azure AD tenant id (or `organizations`/`consumers`) used to pin the
+   * Microsoft OIDC issuer. Required when Microsoft is configured so logins are
+   * restricted to a specific tenant instead of the open `/common/` endpoint.
+   */
+  microsoftTenantId?: string;
+  /**
+   * Comma-separated allowlist of Azure AD tenant ids (the id_token `tid`) that
+   * may sign in. Defaults to the single `microsoftTenantId` when that is a
+   * concrete tenant GUID.
+   */
+  microsoftAllowedTenantIds?: string[];
+  appleClientId?: string;
+  appleTeamId?: string;
+  appleKeyId?: string;
+  applePrivateKey?: string;
+  appleNativeClientId?: string;
+  resendApiKey?: string;
+  emailFrom?: string;
 }
 
 export type EnvSource = Record<string, string | undefined>;
@@ -55,6 +76,27 @@ const developmentCorsOrigins = [
 function raw(env: EnvSource, key: string): string | undefined {
   const value = env[key]?.trim();
   return value ? value : undefined;
+}
+
+// Microsoft authority segments that span more than one tenant. Pinning the
+// issuer to any of these leaves logins open to arbitrary tenants/personal
+// accounts, so they are rejected as a `tid` allowlist source.
+const MICROSOFT_MULTITENANT_AUTHORITIES = new Set(['common', 'organizations', 'consumers']);
+
+/**
+ * Parses a comma-separated tenant id allowlist. Falls back to the single pinned
+ * tenant id when it is a concrete tenant (i.e. not a multi-tenant authority).
+ */
+function parseTenantIds(configured: string | undefined, fallbackTenantId: string | undefined): string[] {
+  const ids = new Set<string>();
+  for (const candidate of (configured ?? '').split(',')) {
+    const trimmed = candidate.trim();
+    if (trimmed) ids.add(trimmed);
+  }
+  if (ids.size === 0 && fallbackTenantId && !MICROSOFT_MULTITENANT_AUTHORITIES.has(fallbackTenantId.toLowerCase())) {
+    ids.add(fallbackTenantId);
+  }
+  return [...ids];
 }
 
 function parsePositiveInteger(value: string | undefined, key: string, issues: string[], fallback?: number): number {
@@ -226,6 +268,35 @@ export function loadApiEnv(env: EnvSource = process.env): ApiEnv {
   }
   const allowedOrigins = parseAllowedOrigins(env, issues, productionMode ? [] : developmentCorsOrigins);
 
+  const microsoftClientId = raw(env, 'MARKLAB_MICROSOFT_CLIENT_ID');
+  const microsoftClientSecret = raw(env, 'MARKLAB_MICROSOFT_CLIENT_SECRET');
+  const microsoftTenantId = raw(env, 'MARKLAB_MICROSOFT_TENANT_ID');
+  const microsoftAllowedTenantIds = parseTenantIds(raw(env, 'MARKLAB_MICROSOFT_ALLOWED_TENANT_IDS'), microsoftTenantId);
+  const microsoftConfigured = Boolean(microsoftClientId && microsoftClientSecret);
+  if (microsoftConfigured) {
+    // The open `/common/` (and `/organizations/`, `/consumers/`) endpoints accept
+    // logins from ANY tenant/personal account, which combined with email-based
+    // account linking enables takeover. Require an explicit tenant pin and at
+    // least one allowed tenant id so the id_token `tid` can be validated.
+    if (!microsoftTenantId) {
+      issues.push('MARKLAB_MICROSOFT_TENANT_ID is required when Microsoft OIDC is configured');
+    } else if (MICROSOFT_MULTITENANT_AUTHORITIES.has(microsoftTenantId.toLowerCase())) {
+      issues.push("MARKLAB_MICROSOFT_TENANT_ID must be a specific tenant id, not 'common'/'organizations'/'consumers'");
+    }
+    if (microsoftAllowedTenantIds.length === 0) {
+      issues.push('MARKLAB_MICROSOFT_ALLOWED_TENANT_IDS (or a concrete MARKLAB_MICROSOFT_TENANT_ID) is required when Microsoft OIDC is configured');
+    }
+  }
+  const appleClientId = raw(env, 'MARKLAB_APPLE_CLIENT_ID');
+  const appleTeamId = raw(env, 'MARKLAB_APPLE_TEAM_ID');
+  const appleKeyId = raw(env, 'MARKLAB_APPLE_KEY_ID');
+  // Allow the PKCS8 key to be provided with literal "\n" escapes (common in env stores).
+  const applePrivateKeyRaw = raw(env, 'MARKLAB_APPLE_PRIVATE_KEY');
+  const applePrivateKey = applePrivateKeyRaw ? applePrivateKeyRaw.replace(/\\n/gu, '\n') : undefined;
+  const appleNativeClientId = raw(env, 'MARKLAB_APPLE_NATIVE_CLIENT_ID');
+  const resendApiKey = raw(env, 'MARKLAB_RESEND_API_KEY');
+  const emailFrom = raw(env, 'MARKLAB_EMAIL_FROM');
+
   if (productionMode) {
     requireProductionValue(env, 'MARKLAB_PUBLIC_WEB_URL', issues);
     requireProductionValue(env, 'MARKLAB_PUBLIC_API_URL', issues);
@@ -292,5 +363,16 @@ export function loadApiEnv(env: EnvSource = process.env): ApiEnv {
     ysweetCheckpointFreqSeconds: ysweetProviderConfig?.checkpointFrequencySeconds ?? 10,
     ysweetSkipGc: ysweetProviderConfig?.skipGc ?? false,
     allowedOrigins,
+    ...(microsoftClientId ? { microsoftClientId } : {}),
+    ...(microsoftClientSecret ? { microsoftClientSecret } : {}),
+    ...(microsoftTenantId ? { microsoftTenantId } : {}),
+    ...(microsoftAllowedTenantIds.length > 0 ? { microsoftAllowedTenantIds } : {}),
+    ...(appleClientId ? { appleClientId } : {}),
+    ...(appleTeamId ? { appleTeamId } : {}),
+    ...(appleKeyId ? { appleKeyId } : {}),
+    ...(applePrivateKey ? { applePrivateKey } : {}),
+    ...(appleNativeClientId ? { appleNativeClientId } : {}),
+    ...(resendApiKey ? { resendApiKey } : {}),
+    ...(emailFrom ? { emailFrom } : {}),
   };
 }

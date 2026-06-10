@@ -15,6 +15,15 @@ describe('local OIDC owner onboarding smoke', () => {
       'owner_can_create_self_serve_workspace',
       'created_workspace_is_listed_for_owner',
       'oidc_discovery_token_and_userinfo_endpoints_were_exercised',
+      'microsoft_oidc_start_persists_provider_and_targets_microsoft_issuer',
+      'microsoft_oidc_callback_mints_ml_user_session_via_provider_routed_exchange',
+      'email_register_creates_unverified_credential',
+      'email_login_rejected_until_verified',
+      'email_login_after_verify_mints_ml_user_session',
+      'email_login_rejects_wrong_password',
+      'email_login_unknown_address_is_enumeration_safe',
+      'apple_first_login_mints_ml_user_session_and_stores_email',
+      'apple_repeat_login_recovers_email_by_subject_and_reuses_user',
     ]);
     expect(result.user).toEqual({
       userId: 'user_1',
@@ -33,6 +42,31 @@ describe('local OIDC owner onboarding smoke', () => {
       discoveryRequests: 2,
       tokenRequests: 1,
       userinfoRequests: 1,
+    });
+
+    // Microsoft OIDC: provider carried through login state, distinct user minted.
+    expect(result.microsoft.provider).toBe('microsoft');
+    expect(result.microsoft.email).toBe('microsoft-owner@example.test');
+    expect(result.microsoft.userId).not.toBe(result.user.userId);
+    expect(result.microsoft.oidcRequests).toEqual({
+      authorizationRequests: 1,
+      discoveryRequests: 2,
+      tokenRequests: 1,
+      userinfoRequests: 1,
+    });
+
+    // Email register -> verify -> login.
+    expect(result.email).toEqual({
+      userId: 'user_3',
+      email: 'email-user@example.test',
+    });
+
+    // Apple: repeat login recovers email by subject without re-minting the user.
+    expect(result.apple).toEqual({
+      userId: 'user_4',
+      email: 'apple-owner@example.test',
+      subject: 'apple-sub-local-smoke',
+      exchangeCalls: 2,
     });
   });
 });

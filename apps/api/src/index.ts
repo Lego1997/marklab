@@ -5,7 +5,9 @@ import type { WebSocketLike } from '@hocuspocus/server';
 import { createCollabServer } from './collab/server';
 import { loadApiEnv } from './config/env';
 import { createPool } from './db/client';
-import { createHttpApp } from './http/app';
+import { createHttpApp, type AuthProvidersOptions } from './http/app';
+import type { OidcAuthConfig } from './services/oidc-service';
+import type { AppleAuthConfig } from './services/apple-auth-service';
 import {
   loadYSweetProviderProcessConfig,
   readYSweetProviderHealth,
@@ -32,6 +34,74 @@ const port = env.port;
 const host = process.env.MARKLAB_HOST ?? process.env.HOST;
 const providerAutosaveIdleGraceMs = 4 * 60 * 1000;
 
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/u, '');
+}
+
+/**
+ * Builds the additional auth providers (Microsoft OIDC, Apple, email+password)
+ * from validated env. Google OIDC is read separately inside the HTTP app from
+ * the legacy MARKLAB_OIDC_* environment, so it is intentionally absent here.
+ */
+function buildAuthProviders(apiEnv: ReturnType<typeof loadApiEnv>): AuthProvidersOptions {
+  const apiBaseUrl = trimTrailingSlash(apiEnv.publicApiUrl);
+  const webBaseUrl = trimTrailingSlash(apiEnv.publicWebUrl);
+  const providers: AuthProvidersOptions = {};
+
+  if (apiEnv.microsoftClientId && apiEnv.microsoftClientSecret) {
+    // Microsoft shares the OIDC callback page; reuse the Google redirect URI by
+    // default so the same registered redirect handles both providers.
+    const microsoftRedirectUri =
+      process.env.MARKLAB_MICROSOFT_REDIRECT_URI?.trim()
+      || process.env.MARKLAB_OIDC_REDIRECT_URI?.trim()
+      || `${webBaseUrl}/auth/callback`;
+    // Pin the issuer to the configured tenant instead of the open `/common/`
+    // endpoint, and verify the id_token's `tid` against the allowlist. Without
+    // this, any Azure tenant or personal Microsoft account could assert an
+    // arbitrary (unverified) email/UPN and be linked onto a victim's account.
+    // env validation guarantees a concrete tenant id + non-empty allowlist here.
+    const tenantId = apiEnv.microsoftTenantId ?? 'common';
+    const microsoft: OidcAuthConfig = {
+      issuer: `https://login.microsoftonline.com/${tenantId}/v2.0`,
+      clientId: apiEnv.microsoftClientId,
+      clientSecret: apiEnv.microsoftClientSecret,
+      redirectUri: microsoftRedirectUri,
+      // The pinned-tenant issuer's discovery doc returns a concrete issuer, so
+      // keep the discovery issuer-match check enabled (default).
+      idTokenValidation: {
+        ...(apiEnv.microsoftAllowedTenantIds ? { allowedTenantIds: apiEnv.microsoftAllowedTenantIds } : {}),
+      },
+    };
+    providers.oidcProviders = { microsoft };
+  }
+
+  if (apiEnv.appleClientId && apiEnv.appleTeamId && apiEnv.appleKeyId && apiEnv.applePrivateKey) {
+    const appleRedirectUri =
+      process.env.MARKLAB_APPLE_REDIRECT_URI?.trim() || `${apiBaseUrl}/api/auth/apple/callback`;
+    const apple: AppleAuthConfig = {
+      clientId: apiEnv.appleClientId,
+      teamId: apiEnv.appleTeamId,
+      keyId: apiEnv.appleKeyId,
+      privateKey: apiEnv.applePrivateKey,
+      redirectUri: appleRedirectUri,
+      ...(apiEnv.appleNativeClientId ? { nativeClientId: apiEnv.appleNativeClientId } : {}),
+    };
+    providers.apple = apple;
+    providers.appleBaseUrls = { apiBaseUrl, webBaseUrl };
+  }
+
+  if (apiEnv.resendApiKey && apiEnv.emailFrom) {
+    providers.email = {
+      resendApiKey: apiEnv.resendApiKey,
+      emailFrom: apiEnv.emailFrom,
+      apiBaseUrl,
+      webBaseUrl,
+    };
+  }
+
+  return providers;
+}
+
 async function main() {
   const pool = createPool(env.databaseUrl);
   const ysweetProviderConfig = env.ysweetProviderMode !== 'disabled'
@@ -52,6 +122,8 @@ async function main() {
       : undefined;
   const collab = createCollabServer(pool);
   const liveWriter = createPostgresLiveMarkdownWriter(pool);
+
+  const authProviders = buildAuthProviders(env);
   const providerDocSockets = new Map<string, Set<Duplex>>();
   let providerDocAutosaveActiveUntilMs = 0;
 
@@ -142,6 +214,7 @@ async function main() {
     ...(collabSnapshotService ? { collabSnapshotService } : {}),
     allowedOrigins: env.allowedOrigins,
     enforceAllowedOrigins: env.mode === 'production',
+    authProviders,
     ...(process.env.MARKLAB_COLLAB_WEB_DIST_DIR ? { staticCollabWeb: { distDir: process.env.MARKLAB_COLLAB_WEB_DIST_DIR } } : {}),
     health: {
       databaseRequired: env.mode === 'production',
