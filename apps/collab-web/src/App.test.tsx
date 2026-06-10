@@ -431,7 +431,7 @@ describe('OIDC auth flow', () => {
       expect(fetch).toHaveBeenCalledWith('/api/auth/oidc/start', expect.objectContaining({
         method: 'POST',
         credentials: 'include',
-        body: JSON.stringify({ native: true, appState: 'native_state_native_state_native_state_1' }),
+        body: JSON.stringify({ provider: 'google', native: true, appState: 'native_state_native_state_native_state_1' }),
       }));
       expect(redirect).toHaveBeenCalledWith('https://login.example.test/authorize?state=state_1');
     });

@@ -1,7 +1,7 @@
 import { CollaborativeMarkdownEditor } from './editor/CollaborativeMarkdownEditor';
 import { ReadOnlyMarkdownView } from './editor/ReadOnlyMarkdownView';
 import { WorkspaceSettings } from './workspaces/WorkspaceSettings';
-import { AuthCallbackPage, SignInPage } from './auth/AuthFlow';
+import { AuthCallbackPage, EmailVerifyPage, PasswordResetPage, SignInPage } from './auth/AuthFlow';
 
 function searchParam(name: string): string | null {
   return new URL(window.location.href).searchParams.get(name);
@@ -36,6 +36,14 @@ export function App() {
 
   if (path === '/auth/callback' || path === '/auth/callback/') {
     return <AuthCallbackPage />;
+  }
+
+  if (path === '/auth/verify' || path === '/auth/verify/') {
+    return <EmailVerifyPage />;
+  }
+
+  if (path === '/auth/reset' || path === '/auth/reset/') {
+    return <PasswordResetPage />;
   }
 
   if (path.match(/^\/workspaces\/[^/]+\/settings\/?$/u)) {
