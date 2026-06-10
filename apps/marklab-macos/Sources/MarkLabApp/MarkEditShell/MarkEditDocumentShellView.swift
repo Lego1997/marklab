@@ -245,7 +245,7 @@ struct MarkEditDocumentShellView: View {
           Label(Self.openMarkdownButtonTitle, systemImage: "doc.text")
             .foregroundStyle(.secondary)
             .padding(12)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .glassControl(cornerRadius: 8)
         }
         .buttonStyle(.plain)
         .help(Self.openMarkdownButtonTitle)
@@ -412,11 +412,7 @@ struct MarkEditDocumentShellView: View {
     .foregroundStyle(model.hasSharedDocument ? Color(nsColor: .systemBlue) : Color.primary)
     .padding(.horizontal, model.hasSharedDocument ? 6 : 0)
     .padding(.vertical, model.hasSharedDocument ? 3 : 0)
-    .background(
-      Color(nsColor: .systemBlue)
-        .opacity(model.hasSharedDocument ? Self.sharingToolbarActiveBackgroundOpacity : 0),
-      in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-    )
+    .modifier(SharingToolbarPillBackground(active: model.hasSharedDocument))
   }
 
   private var localFormattingEnabled: Bool {
@@ -466,7 +462,7 @@ struct MarkEditDocumentShellView: View {
       }
       .padding(16)
     }
-    .background(.regularMaterial)
+    .glassPanel(cornerRadius: 0)
   }
 
   private var inspectorHeader: some View {
@@ -810,7 +806,7 @@ struct MarkEditDocumentShellView: View {
         severity == .error ? Color(nsColor: .systemRed).opacity(0.14) : Color.clear,
         in: RoundedRectangle(cornerRadius: 6, style: .continuous)
       )
-      .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+      .glassSubtle(cornerRadius: 6)
       .overlay {
         RoundedRectangle(cornerRadius: 6, style: .continuous)
           .stroke(
@@ -1385,5 +1381,19 @@ private struct MarkEditConflictReviewView: View {
       }
     }
     .frame(maxWidth: .infinity, alignment: .topLeading)
+  }
+}
+
+/// Glass-backed background for the collaboration toolbar pill while sharing is
+/// active. Inactive pills stay transparent, matching the prior plain toolbar.
+private struct SharingToolbarPillBackground: ViewModifier {
+  let active: Bool
+
+  func body(content: Content) -> some View {
+    if active {
+      content.glassControl(cornerRadius: 6, tint: Color(nsColor: .systemBlue))
+    } else {
+      content
+    }
   }
 }

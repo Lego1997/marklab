@@ -32,11 +32,11 @@ public enum NativeHTTPError: Error, Equatable {
   case invalidJSON
 }
 
-public protocol NativeHTTPTransport: AnyObject {
+public protocol NativeHTTPTransport: AnyObject, Sendable {
   func send(_ request: NativeHTTPRequest) async throws -> NativeHTTPResponse
 }
 
-public final class URLSessionNativeHTTPTransport: NativeHTTPTransport {
+public final class URLSessionNativeHTTPTransport: NativeHTTPTransport, Sendable {
   private let session: URLSession
 
   public init(session: URLSession = .shared) {

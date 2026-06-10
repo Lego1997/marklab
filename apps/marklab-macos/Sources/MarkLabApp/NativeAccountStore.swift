@@ -15,6 +15,55 @@ enum NativeAccountSignInNotification {
   static let tokenKey = "token"
 }
 
+/// Shared post-sign-in account-establishment pipeline.
+///
+/// Given a freshly minted session token, resolves the user + workspace, builds a
+/// `NativeStoredAccount`, persists it, and broadcasts `.markLabAccountDidSignIn`.
+/// Reused by the browser OIDC deep-link callback, the native Sign in with Apple
+/// success handler, and the Settings sign-in surface so workspace logic lives in
+/// exactly one place.
+enum NativeAccountEstablishment {
+  @discardableResult
+  static func establish(
+    token: String,
+    apiBaseURL: URL,
+    webBaseURL: URL,
+    accountStore: NativeAccountStore?,
+    transport: NativeHTTPTransport
+  ) async throws -> NativeStoredAccount {
+    let client = NativeAccountClient(
+      apiBaseURL: apiBaseURL,
+      bearerToken: token,
+      transport: transport
+    )
+    let user = try await client.currentUser()
+    let workspaces = try await client.listWorkspaces()
+    let workspace: NativeWorkspaceSummary
+    if let existing = workspaces.first(where: { $0.role == "Owner" }) ?? workspaces.first {
+      workspace = existing
+    } else {
+      workspace = try await client.createWorkspace(name: "\(user.displayName) Workspace")
+    }
+    let account = NativeStoredAccount(
+      apiBaseURL: apiBaseURL,
+      webBaseURL: webBaseURL,
+      token: token,
+      userId: user.userId,
+      email: user.email,
+      displayName: user.displayName,
+      workspaceId: workspace.workspaceId,
+      workspaceName: workspace.name
+    )
+    try accountStore?.save(account)
+    NotificationCenter.default.post(
+      name: .markLabAccountDidSignIn,
+      object: nil,
+      userInfo: [NativeAccountSignInNotification.tokenKey: account.token]
+    )
+    return account
+  }
+}
+
 enum NativeAuthPendingState {
   static func generate() -> String {
     var bytes = [UInt8](repeating: 0, count: 32)
@@ -74,7 +123,7 @@ final class NativeAccountStore: @unchecked Sendable {
   func save(_ account: NativeStoredAccount) throws {
     try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
     let data = try JSONEncoder().encode(account)
-    try data.write(to: accountURL, options: [.atomic, .completeFileProtection])
+    try Self.writeProtected(data, to: accountURL)
     try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: accountURL.path)
   }
 
@@ -92,8 +141,44 @@ final class NativeAccountStore: @unchecked Sendable {
 
   func savePendingAuthState(_ state: String) throws {
     try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-    try Data(state.utf8).write(to: pendingAuthStateURL, options: [.atomic, .completeFileProtection])
+    try Self.writeProtected(Data(state.utf8), to: pendingAuthStateURL)
     try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pendingAuthStateURL.path)
+  }
+
+  /// Writes `data` atomically with complete file protection when the host process is
+  /// entitled to request it (the shipping sandboxed app). Outside that context — unit
+  /// tests and unsandboxed/un-entitled tooling — the `.completeFileProtection`
+  /// data-protection class is rejected by the filesystem (NSCocoaErrorDomain 513,
+  /// underlying NSPOSIXErrorDomain 1 "Operation not permitted"). In that case we fall
+  /// back to a plain atomic write. At-rest confidentiality is still enforced by the
+  /// `0o600` POSIX permissions the callers apply.
+  private static func writeProtected(_ data: Data, to url: URL) throws {
+    do {
+      try data.write(to: url, options: [.atomic, .completeFileProtection])
+    } catch let error as NSError where isDataProtectionUnavailable(error) {
+      try data.write(to: url, options: [.atomic])
+    }
+  }
+
+  /// True when an error reflects the environment refusing the `.completeFileProtection`
+  /// data-protection class rather than a genuine I/O failure we should surface.
+  private static func isDataProtectionUnavailable(_ error: NSError) -> Bool {
+    func mentionsOperationNotPermitted(_ error: NSError) -> Bool {
+      if error.domain == NSPOSIXErrorDomain, error.code == Int(EPERM) {
+        return true
+      }
+      if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+        return mentionsOperationNotPermitted(underlying)
+      }
+      return false
+    }
+    // The protected write surfaces as NSFileWriteNoPermissionError (Cocoa 513) when the
+    // data-protection class is refused; tolerate NSFileWriteUnknownError (512) too.
+    let writeFailureCodes: Set<Int> = [NSFileWriteNoPermissionError, NSFileWriteUnknownError]
+    guard error.domain == NSCocoaErrorDomain, writeFailureCodes.contains(error.code) else {
+      return false
+    }
+    return mentionsOperationNotPermitted(error)
   }
 
   func clearPendingAuthState() throws {

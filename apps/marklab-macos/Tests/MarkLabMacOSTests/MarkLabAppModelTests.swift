@@ -38,7 +38,11 @@ struct MarkLabAppModelTests {
 
     model.handleOpenURL(URL(string: "marklab://auth/callback?token=ml_user_session&appState=native_state_native_state_native_state_1&apiBaseURL=https://api.example.test&webBaseURL=https://app.example.test&userId=user_1&email=alice@example.test&displayName=Alice+OIDC")!)
     try await waitForRecordedRequests(transport, count: 3)
-    await Task.yield()
+    // The pending auth state is cleared as the final step of the callback flow,
+    // strictly after `activeAccount` is set, so it is the terminal signal here.
+    try await waitForCondition {
+      model.activeAccount != nil && ((try? accountStore.loadPendingAuthState()) ?? nil) == nil
+    }
 
     #expect(model.nativeBearerToken == "ml_user_session")
     #expect(model.hasHostedShareController)
@@ -54,6 +58,60 @@ struct MarkLabAppModelTests {
     #expect(transport.requests.allSatisfy { $0.authorization == "Bearer ml_user_session" })
     #expect(transport.requests[2].jsonBody?["name"] as? String == "Alice OIDC Workspace")
     #expect(try accountStore.loadPendingAuthState() == nil)
+  }
+
+  @MainActor
+  @Test("native Sign in with Apple mints a session, stores the account, and enables hosted sharing")
+  func appleNativeSignInStoresAccountCreatesWorkspaceAndEnablesHostedSharing() async throws {
+    let directory = try TemporaryDirectory()
+    let accountStore = NativeAccountStore(directoryURL: directory.url.appending(path: "account", directoryHint: .isDirectory))
+    let transport = RecordingHTTPTransport()
+    transport.enqueue(json: #"{"token":"ml_user_apple","user":{"userId":"user_apple","email":"apple@example.test","displayName":"Apple Person"},"expiresAt":"2026-12-01T00:00:00Z"}"#, statusCode: 201)
+    transport.enqueue(json: #"{"authenticated":true,"user":{"userId":"user_apple","email":"apple@example.test","displayName":"Apple Person"}}"#)
+    transport.enqueue(json: #"{"workspaces":[]}"#)
+    transport.enqueue(json: #"{"workspace":{"workspaceId":"ws_apple","name":"Apple Person Workspace","role":"Owner"}}"#, statusCode: 201)
+    let model = MarkLabAppModel(
+      hostedShareController: nil,
+      baselineStore: InMemoryNativeProjectionBaselineStore(),
+      conflictStore: NativeConflictStore(directoryURL: directory.url.appending(path: "conflicts", directoryHint: .isDirectory)),
+      sharedDocumentBindingStore: InMemoryNativeSharedDocumentBindingStore(),
+      nativeBearerToken: nil,
+      accountStore: accountStore,
+      accountTransport: transport,
+      hostedDefaults: NativeHostedDefaults(
+        apiBaseURL: URL(string: "https://api.example.test")!,
+        webBaseURL: URL(string: "https://app.example.test")!
+      )
+    )
+
+    model.completeAppleNativeSignIn(
+      identityToken: "apple.identity.jwt",
+      authorizationCode: "apple-auth-code",
+      fullName: "Apple Person"
+    )
+    try await waitForRecordedRequests(transport, count: 4)
+    try await waitForCondition { model.activeAccount != nil }
+
+    #expect(model.nativeBearerToken == "ml_user_apple")
+    #expect(model.hasHostedShareController)
+    #expect(model.activeAccount?.workspaceId == "ws_apple")
+    #expect(model.activeAccount?.displayName == "Apple Person")
+    #expect(model.statusText == "Signed in as Apple Person. Workspace: Apple Person Workspace.")
+    #expect(try accountStore.load()?.workspaceId == "ws_apple")
+    #expect(transport.requests.map { "\($0.method) \($0.percentEncodedPath)" } == [
+      "POST /api/auth/apple/native",
+      "GET /api/auth/session",
+      "GET /api/workspaces",
+      "POST /api/workspaces",
+    ])
+    let mintRequest = try #require(transport.requests.first)
+    #expect(mintRequest.nativeAppProof == "1")
+    #expect(mintRequest.authorization == nil)
+    #expect(mintRequest.jsonBody?["identityToken"] as? String == "apple.identity.jwt")
+    #expect(mintRequest.jsonBody?["authorizationCode"] as? String == "apple-auth-code")
+    #expect((mintRequest.jsonBody?["user"] as? [String: Any])?["name"] as? String == "Apple Person")
+    #expect(transport.requests.dropFirst().allSatisfy { $0.authorization == "Bearer ml_user_apple" })
+    #expect(transport.requests.dropFirst().allSatisfy { $0.nativeAppProof == nil })
   }
 
   @MainActor

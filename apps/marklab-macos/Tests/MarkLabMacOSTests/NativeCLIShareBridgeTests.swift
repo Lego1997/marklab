@@ -462,7 +462,7 @@ struct NativeCLIShareBridgeTests {
   }
 }
 
-private final class TokenRotationHTTPTransport: NativeHTTPTransport {
+private final class TokenRotationHTTPTransport: NativeHTTPTransport, @unchecked Sendable {
   private(set) var requests: [RecordedHTTPRequest] = []
   private var grantCount = 0
 

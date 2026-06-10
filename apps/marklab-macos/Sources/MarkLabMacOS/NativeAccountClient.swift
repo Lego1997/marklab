@@ -24,6 +24,12 @@ public struct NativeWorkspaceSummary: Codable, Equatable, Sendable {
   }
 }
 
+public struct NativeAppleSignInResult: Decodable, Equatable, Sendable {
+  public let token: String
+  public let user: NativeAccountUser
+  public let expiresAt: String
+}
+
 public final class NativeAccountClient: @unchecked Sendable {
   private let apiBaseURL: URL
   private let bearerToken: String
@@ -75,6 +81,42 @@ public final class NativeAccountClient: @unchecked Sendable {
 
   public func logout() async throws {
     _ = try await sendJSON("POST", "/api/auth/logout", response: EmptyNativeResponse.self)
+  }
+
+  /// Exchanges a native Sign in with Apple credential for a hosted session.
+  ///
+  /// This endpoint mints the session, so it is unauthenticated (no bearer) and
+  /// proves it originates from the native app via the `X-MarkLab-Native-App` header.
+  public static func authenticateWithApple(
+    apiBaseURL: URL,
+    identityToken: String,
+    authorizationCode: String?,
+    fullName: String?,
+    transport: NativeHTTPTransport = URLSessionNativeHTTPTransport()
+  ) async throws -> NativeAppleSignInResult {
+    struct UserBody: Encodable {
+      let name: String?
+    }
+    struct Body: Encodable {
+      let identityToken: String
+      let authorizationCode: String?
+      let user: UserBody
+    }
+    let body = try nativeJSONData(Body(
+      identityToken: identityToken,
+      authorizationCode: authorizationCode,
+      user: UserBody(name: fullName)
+    ))
+    let request = NativeHTTPRequest(
+      method: "POST",
+      url: appendPath("/api/auth/apple/native", to: apiBaseURL),
+      headers: [
+        "Content-Type": "application/json",
+        "X-MarkLab-Native-App": "1",
+      ],
+      body: body
+    )
+    return try decodeNativeJSON(NativeAppleSignInResult.self, from: try await transport.send(request))
   }
 
   private func sendJSON<Response: Decodable>(

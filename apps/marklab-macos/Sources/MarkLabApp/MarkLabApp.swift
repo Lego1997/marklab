@@ -810,40 +810,55 @@ final class MarkLabAppModel: ObservableObject {
           statusText = "Sign-in failed. Try again from Settings."
           return
         }
-        let client = NativeAccountClient(
-          apiBaseURL: callback.apiBaseURL,
-          bearerToken: callback.token,
-          transport: accountTransport
-        )
-        let user = try await client.currentUser()
-        let workspaces = try await client.listWorkspaces()
-        let workspace: NativeWorkspaceSummary
-        if let existing = workspaces.first(where: { $0.role == "Owner" }) ?? workspaces.first {
-          workspace = existing
-        } else {
-          workspace = try await client.createWorkspace(name: "\(user.displayName) Workspace")
-        }
-        let account = NativeStoredAccount(
-          apiBaseURL: callback.apiBaseURL,
-          webBaseURL: callback.webBaseURL,
+        try await establishSignedInAccount(
           token: callback.token,
-          userId: user.userId,
-          email: user.email,
-          displayName: user.displayName,
-          workspaceId: workspace.workspaceId,
-          workspaceName: workspace.name
+          apiBaseURL: callback.apiBaseURL,
+          webBaseURL: callback.webBaseURL
         )
-        try accountStore?.save(account)
         try? accountStore?.clearPendingAuthState()
-        applySignedInState(account, status: "Signed in as \(account.displayName). Workspace: \(account.workspaceName).")
-        NotificationCenter.default.post(
-          name: .markLabAccountDidSignIn,
-          object: nil,
-          userInfo: [NativeAccountSignInNotification.tokenKey: account.token]
-        )
       } catch {
         try? accountStore?.clearPendingAuthState()
         statusText = "Sign-in failed. Try again from Settings."
+      }
+    }
+  }
+
+  /// Shared post-sign-in pipeline: resolves the user and workspace for a freshly
+  /// minted session token, persists the account, enables hosted sharing, and
+  /// broadcasts `.markLabAccountDidSignIn`. Reused by the browser OIDC deep-link
+  /// callback and the native Sign in with Apple success handler.
+  private func establishSignedInAccount(token: String, apiBaseURL: URL, webBaseURL: URL) async throws {
+    let account = try await NativeAccountEstablishment.establish(
+      token: token,
+      apiBaseURL: apiBaseURL,
+      webBaseURL: webBaseURL,
+      accountStore: accountStore,
+      transport: accountTransport
+    )
+    applySignedInState(account, status: "Signed in as \(account.displayName). Workspace: \(account.workspaceName).")
+  }
+
+  /// Completes native Sign in with Apple: exchanges the Apple credential for a
+  /// hosted session, then runs the shared account-establishment pipeline.
+  func completeAppleNativeSignIn(identityToken: String, authorizationCode: String?, fullName: String?) {
+    statusText = "Finishing sign-in with Apple..."
+    Task { @MainActor in
+      do {
+        let result = try await NativeAccountClient.authenticateWithApple(
+          apiBaseURL: hostedDefaults.apiBaseURL,
+          identityToken: identityToken,
+          authorizationCode: authorizationCode,
+          fullName: fullName,
+          transport: accountTransport
+        )
+        try await establishSignedInAccount(
+          token: result.token,
+          apiBaseURL: hostedDefaults.apiBaseURL,
+          webBaseURL: hostedDefaults.webBaseURL
+        )
+      } catch {
+        statusText = "Couldn't finish Sign in with Apple. Opening the browser sign-in instead."
+        openSignInPage()
       }
     }
   }

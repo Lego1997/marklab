@@ -68,6 +68,25 @@ func waitForRecordedRequests(
   }
 }
 
+/// Polls `condition` until it becomes true or the timeout elapses. Recording the
+/// HTTP request count only proves a request *started*; the post-response work
+/// (persisting the account, the `@MainActor` state hop in `applySignedInState`,
+/// the `.markLabAccountDidSignIn` broadcast) can still be in flight. Waiting on
+/// the observable end-state instead avoids racing those continuations under
+/// parallel test execution.
+@MainActor
+func waitForCondition(
+  timeoutNanoseconds: UInt64 = 1_000_000_000,
+  _ condition: () -> Bool
+) async throws {
+  let step: UInt64 = 10_000_000
+  var elapsed: UInt64 = 0
+  while !condition() && elapsed < timeoutNanoseconds {
+    try await Task.sleep(nanoseconds: step)
+    elapsed += step
+  }
+}
+
 actor BlockingFirstHTTPTransport: NativeHTTPTransport {
   private var responses: [NativeHTTPResponse] = []
   private(set) var requests: [RecordedHTTPRequest] = []
