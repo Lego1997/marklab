@@ -1,0 +1,20 @@
+{
+  "name": "marklab-local",
+  "interface": {
+    "displayName": "MarkLab Local"
+  },
+  "plugins": [
+    {
+      "name": "marklab-codex",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

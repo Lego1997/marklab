@@ -1,0 +1,38 @@
+{
+  "name": "@marklab/codex-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex plugin and MCP bridge for safe MarkLab Markdown collaboration.",
+  "main": "dist/server.js",
+  "bin": {
+    "marklab-codex-mcp": "dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --config vitest.config.ts",
+    "test:mcp-registration": "vitest run --config vitest.config.ts test/mcp-registration.test.ts",
+    "test:roundtrip-unit": "vitest run --config vitest.config.ts test/roundtrip-unit.test.ts",
+    "test:conflict-surface": "vitest run --config vitest.config.ts test/conflict-surface.test.ts",
+    "test:conflict-stop-e2e": "vitest run --config vitest.config.ts test/conflict-stop-e2e.test.ts",
+    "test:roundtrip-e2e": "vitest run --config vitest.config.ts test/roundtrip-e2e.test.ts",
+    "test:share-join": "vitest run --config vitest.config.ts test/share-join.test.ts",
+    "scope-gate": "bash scripts/check-scope.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.0",
+    "@y-sweet/client": "0.9.1",
+    "@y-sweet/sdk": "0.9.1",
+    "typescript": "^5.8.0",
+    "vitest": "^3.0.0",
+    "ws": "^8.18.0",
+    "yjs": "^13.6.0"
+  },
+  "engines": {
+    "node": "^20.19.0 || ^22.12.0 || >=24.0.0"
+  }
+}

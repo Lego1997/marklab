@@ -1,0 +1,24 @@
+{
+  "name": "marklab-codex",
+  "version": "0.1.0",
+  "description": "Coordinate safe MarkLab shared Markdown edits from Codex.",
+  "author": {
+    "name": "MarkLab"
+  },
+  "license": "UNLICENSED",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "MarkLab for Codex",
+    "shortDescription": "Safe coordination tools for live shared Markdown files.",
+    "longDescription": "MarkLab for Codex exposes coordination-only MCP tools and a safety skill so Codex can edit local Markdown files that are also being edited live through MarkLab.",
+    "developerName": "MarkLab",
+    "category": "Productivity",
+    "capabilities": ["MCP tools", "Agent skill"],
+    "defaultPrompt": [
+      "Safely edit a shared MarkLab Markdown file.",
+      "Check MarkLab sync and conflicts for a file.",
+      "Create a redacted MarkLab edit share link."
+    ]
+  }
+}
